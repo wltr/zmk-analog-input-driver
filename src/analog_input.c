@@ -129,7 +129,7 @@ static int analog_input_report_data(const struct device *dev) {
         int32_t raw = data->as_buff[i];
         int32_t mv = raw;
         // adc_raw_to_millivolts(750, ADC_GAIN_1_3, as->resolution, &mv);
-        adc_raw_to_microvolts(750, ADC_GAIN_1_3, as->resolution, &mv);
+        // adc_raw_to_microvolts(750, ADC_GAIN_1_3, as->resolution, &mv);
 
         filter[i][++index[i] & 0x00000007] = mv;
 
@@ -139,23 +139,23 @@ static int analog_input_report_data(const struct device *dev) {
           return 0;
         }
         uint32_t mid_avg = mid[i] >> 9;
-
-        mv = 0;
-        for (uint8_t k = 0; k < 8; ++k) {
-          mv += filter[i][k];
+        if (ch_cfg.mv_mid) {
+            mid_avg = ch_cfg.mv_mid;
         }
-        mv >>= 3;
+
+        // mv = 0;
+        // for (uint8_t k = 0; k < 8; ++k) {
+        //   mv += filter[i][k];
+        // }
+        // mv >>= 3;
 
         int32_t v = mv - mid_avg;
-        if (ch_cfg.mv_mid) {
-            v = mv - ch_cfg.mv_mid;
-        }
 
 #if IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_RAW)
         LOG_DBG("AIN%u raw: %d mv: %d, mid %d, off %d", ch_cfg.adc_channel.channel_id, raw, mv, mid_avg, v);
 #endif
 
-        uint16_t dz = ch_cfg.mv_deadzone * 1000;
+        uint16_t dz = ch_cfg.mv_deadzone;
         if (dz) {
             if (v > 0) {
                 if (v < dz) v = 0; else v -= dz;
@@ -171,7 +171,7 @@ static int analog_input_report_data(const struct device *dev) {
         }
 
         if (ch_cfg.invert) v *= -1;
-        v = (int16_t)((v * ch_cfg.scale_multiplier) / (ch_cfg.scale_divisor * 1000));
+        v = (int16_t)((v * ch_cfg.scale_multiplier) / ch_cfg.scale_divisor);
 
         if (ch_cfg.report_on_change_only) {
             // track raw value to compare until next report interval
