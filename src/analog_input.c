@@ -18,6 +18,67 @@ LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
 
 #include <zmk/drivers/analog_input.h>
 
+struct gain_desc {
+  uint8_t mul;
+  uint8_t div;
+};
+
+static const struct gain_desc gains[] = {
+  [ADC_GAIN_1_6] = {.mul = 6, .div = 1},
+  [ADC_GAIN_1_5] = {.mul = 5, .div = 1},
+  [ADC_GAIN_1_4] = {.mul = 4, .div = 1},
+  [ADC_GAIN_1_3] = {.mul = 3, .div = 1},
+  [ADC_GAIN_2_5] = {.mul = 5, .div = 2},
+  [ADC_GAIN_1_2] = {.mul = 2, .div = 1},
+  [ADC_GAIN_2_3] = {.mul = 3, .div = 2},
+  [ADC_GAIN_4_5] = {.mul = 5, .div = 4},
+  [ADC_GAIN_1] = {.mul = 1, .div = 1},
+  [ADC_GAIN_2] = {.mul = 1, .div = 2},
+  [ADC_GAIN_3] = {.mul = 1, .div = 3},
+  [ADC_GAIN_4] = {.mul = 1, .div = 4},
+  [ADC_GAIN_6] = {.mul = 1, .div = 6},
+  [ADC_GAIN_8] = {.mul = 1, .div = 8},
+  [ADC_GAIN_12] = {.mul = 1, .div = 12},
+  [ADC_GAIN_16] = {.mul = 1, .div = 16},
+  [ADC_GAIN_24] = {.mul = 1, .div = 24},
+  [ADC_GAIN_32] = {.mul = 1, .div = 32},
+  [ADC_GAIN_64] = {.mul = 1, .div = 64},
+  [ADC_GAIN_128] = {.mul = 1, .div = 128},
+};
+
+static inline int adc_gain_invert_64(enum adc_gain gain, int64_t *value)
+{
+  int rv = -EINVAL;
+
+  if ((uint8_t)gain < ARRAY_SIZE(gains)) {
+    const struct gain_desc *gdp = &gains[gain];
+
+    __ASSERT_NO_MSG(gdp->mul != 0);
+    __ASSERT_NO_MSG(gdp->div != 0);
+    *value = (gdp->mul * *value) / gdp->div;
+    rv = 0;
+  }
+
+  return rv;
+}
+
+static inline int adc_raw_to_microvolts(int32_t ref_mv, enum adc_gain gain, uint8_t resolution, int32_t *valp)
+{
+  int64_t adc_uv = (int64_t)*valp * ref_mv * 1000;
+  int ret = adc_gain_invert_64(gain, &adc_uv);
+
+  if (ret == 0) {
+    *valp = (int32_t)(adc_uv >> resolution);
+  }
+
+  return ret;
+}
+
+static uint32_t mid[2] = {0};
+static uint16_t count[2] = {0};
+static uint32_t filter[2][8] = {0};
+static uint8_t index[2] = {0};
+
 static int analog_input_report_data(const struct device *dev) {
     struct analog_input_data *data = dev->data;
     const struct analog_input_config *config = dev->config;
@@ -67,13 +128,34 @@ static int analog_input_report_data(const struct device *dev) {
 
         int32_t raw = data->as_buff[i];
         int32_t mv = raw;
-        adc_raw_to_millivolts(adc_ref_internal(adc), ADC_GAIN_1_6, as->resolution, &mv);
+        // adc_raw_to_millivolts(750, ADC_GAIN_1_3, as->resolution, &mv);
+        adc_raw_to_microvolts(750, ADC_GAIN_1_3, as->resolution, &mv);
+
+        filter[i][++index[i] & 0x00000007] = mv;
+
+        if (count[i] < 512) {
+          mid[i] += mv;
+          ++count[i];
+          return 0;
+        }
+        uint32_t mid_avg = mid[i] >> 9;
+
+        mv = 0;
+        for (uint8_t k = 0; k < 8; ++k) {
+          mv += filter[i][k];
+        }
+        mv >>= 3;
+
+        int32_t v = mv - mid_avg;
+        if (ch_cfg.mv_mid) {
+            v = mv - ch_cfg.mv_mid;
+        }
+
 #if IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_RAW)
-        LOG_DBG("AIN%u raw: %d mv: %d", ch_cfg.adc_channel.channel_id, raw, mv);
+        LOG_DBG("AIN%u raw: %d mv: %d, mid %d, off %d", ch_cfg.adc_channel.channel_id, raw, mv, mid_avg, v);
 #endif
 
-        int16_t v = mv - ch_cfg.mv_mid;
-        int16_t dz = ch_cfg.mv_deadzone;
+        uint16_t dz = ch_cfg.mv_deadzone * 1000;
         if (dz) {
             if (v > 0) {
                 if (v < dz) v = 0; else v -= dz;
@@ -89,7 +171,7 @@ static int analog_input_report_data(const struct device *dev) {
         }
 
         if (ch_cfg.invert) v *= -1;
-        v = (int16_t)((v * ch_cfg.scale_multiplier) / ch_cfg.scale_divisor);
+        v = (int16_t)((v * ch_cfg.scale_multiplier) / (ch_cfg.scale_divisor * 1000));
 
         if (ch_cfg.report_on_change_only) {
             // track raw value to compare until next report interval
@@ -216,7 +298,7 @@ static int enable_set_value(const struct device *dev, bool enable) {
     if (data->enabled == enable) {
         return 0;
     }
-    
+
     LOG_DBG("%d", enable ? 1 : 0);
     if (enable) {
         if (data->sampling_hz != 0) {
@@ -237,7 +319,7 @@ static int enable_set_value(const struct device *dev, bool enable) {
 
 static void analog_input_async_init(struct k_work *work) {
     struct k_work_delayable *work_delayable = (struct k_work_delayable *)work;
-    struct analog_input_data *data = CONTAINER_OF(work_delayable, 
+    struct analog_input_data *data = CONTAINER_OF(work_delayable,
                                                   struct analog_input_data, init_work);
     const struct device *dev = data->dev;
     const struct analog_input_config *config = dev->config;
@@ -249,10 +331,10 @@ static void analog_input_async_init(struct k_work *work) {
         struct analog_input_io_channel ch_cfg = (struct analog_input_io_channel)config->io_channels[i];
         const struct device* adc = ch_cfg.adc_channel.dev;
         uint8_t channel_id = ch_cfg.adc_channel.channel_id;
-        
+
         struct adc_channel_cfg channel_cfg = {
-            .gain = ADC_GAIN_1_6,
-            .reference = ADC_REF_INTERNAL,
+            .gain = ADC_GAIN_1_3,
+            .reference = ADC_REF_VDD_1_4,
             .acquisition_time = ADC_ACQ_TIME_DEFAULT,
             .channel_id = channel_id,
             #ifdef CONFIG_ADC_CONFIGURABLE_INPUTS
