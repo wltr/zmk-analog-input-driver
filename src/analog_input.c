@@ -18,66 +18,15 @@ LOG_MODULE_REGISTER(ANALOG_INPUT, CONFIG_ANALOG_INPUT_LOG_LEVEL);
 
 #include <zmk/drivers/analog_input.h>
 
-struct gain_desc {
-  uint8_t mul;
-  uint8_t div;
-};
-
-static const struct gain_desc gains[] = {
-  [ADC_GAIN_1_6] = {.mul = 6, .div = 1},
-  [ADC_GAIN_1_5] = {.mul = 5, .div = 1},
-  [ADC_GAIN_1_4] = {.mul = 4, .div = 1},
-  [ADC_GAIN_1_3] = {.mul = 3, .div = 1},
-  [ADC_GAIN_2_5] = {.mul = 5, .div = 2},
-  [ADC_GAIN_1_2] = {.mul = 2, .div = 1},
-  [ADC_GAIN_2_3] = {.mul = 3, .div = 2},
-  [ADC_GAIN_4_5] = {.mul = 5, .div = 4},
-  [ADC_GAIN_1] = {.mul = 1, .div = 1},
-  [ADC_GAIN_2] = {.mul = 1, .div = 2},
-  [ADC_GAIN_3] = {.mul = 1, .div = 3},
-  [ADC_GAIN_4] = {.mul = 1, .div = 4},
-  [ADC_GAIN_6] = {.mul = 1, .div = 6},
-  [ADC_GAIN_8] = {.mul = 1, .div = 8},
-  [ADC_GAIN_12] = {.mul = 1, .div = 12},
-  [ADC_GAIN_16] = {.mul = 1, .div = 16},
-  [ADC_GAIN_24] = {.mul = 1, .div = 24},
-  [ADC_GAIN_32] = {.mul = 1, .div = 32},
-  [ADC_GAIN_64] = {.mul = 1, .div = 64},
-  [ADC_GAIN_128] = {.mul = 1, .div = 128},
-};
-
-static inline int adc_gain_invert_64(enum adc_gain gain, int64_t *value)
-{
-  int rv = -EINVAL;
-
-  if ((uint8_t)gain < ARRAY_SIZE(gains)) {
-    const struct gain_desc *gdp = &gains[gain];
-
-    __ASSERT_NO_MSG(gdp->mul != 0);
-    __ASSERT_NO_MSG(gdp->div != 0);
-    *value = (gdp->mul * *value) / gdp->div;
-    rv = 0;
-  }
-
-  return rv;
-}
-
-static inline int adc_raw_to_microvolts(int32_t ref_mv, enum adc_gain gain, uint8_t resolution, int32_t *valp)
-{
-  int64_t adc_uv = (int64_t)*valp * ref_mv * 1000;
-  int ret = adc_gain_invert_64(gain, &adc_uv);
-
-  if (ret == 0) {
-    *valp = (int32_t)(adc_uv >> resolution);
-  }
-
-  return ret;
-}
-
 static uint32_t mid[2] = {0};
 static uint16_t count[2] = {0};
-static uint32_t filter[2][8] = {0};
+static uint32_t filter[2][32] = {0};
 static uint8_t index[2] = {0};
+static uint16_t prev[2] = {0};
+
+static inline int compare_integers(const void *a, const void *b) {
+    return (*(int *)a - *(int *)b);
+}
 
 static int analog_input_report_data(const struct device *dev) {
     struct analog_input_data *data = dev->data;
@@ -126,33 +75,37 @@ static int analog_input_report_data(const struct device *dev) {
 #endif
         }
 
-        int32_t raw = data->as_buff[i];
-        int32_t mv = raw;
-        // adc_raw_to_millivolts(750, ADC_GAIN_1_3, as->resolution, &mv);
-        // adc_raw_to_microvolts(750, ADC_GAIN_1_3, as->resolution, &mv);
+        int32_t mv = data->as_buff[i];
 
-        filter[i][++index[i] & 0x00000007] = mv;
+        filter[i][++index[i] & 0x0000001F] = mv;
+        if (index[i] < 32) {
+          continue;
+        }
 
-        if (count[i] < 512) {
+        qsort(filter[i], 32, sizeof(uint32_t), compare_integers);
+        mv = 0;
+        for (uint8_t k = 8; k < 24; ++k) {
+          mv += filter[i][k];
+        }
+        mv >>= 4;
+
+        if (count[i] < 1024) {
           mid[i] += mv;
           ++count[i];
-          return 0;
+          continue;
         }
-        uint32_t mid_avg = mid[i] >> 9;
+        uint32_t mid_avg = (mid[i] >> 10);
         if (ch_cfg.mv_mid) {
             mid_avg = ch_cfg.mv_mid;
         }
 
-        // mv = 0;
-        // for (uint8_t k = 0; k < 8; ++k) {
-        //   mv += filter[i][k];
-        // }
-        // mv >>= 3;
+        int16_t diff = mv - prev[i];
+        prev[i] = mv;
 
         int32_t v = mv - mid_avg;
 
 #if IS_ENABLED(CONFIG_ANALOG_INPUT_LOG_DBG_RAW)
-        LOG_DBG("AIN%u raw: %d mv: %d, mid %d, off %d", ch_cfg.adc_channel.channel_id, raw, mv, mid_avg, v);
+        LOG_DBG("AIN%u mv: %d, mid %d, off %d, diff %d", ch_cfg.adc_channel.channel_id, mv, mid_avg, v, diff);
 #endif
 
         uint16_t dz = ch_cfg.mv_deadzone;
@@ -174,7 +127,6 @@ static int analog_input_report_data(const struct device *dev) {
         v = (int16_t)((v * ch_cfg.scale_multiplier) / ch_cfg.scale_divisor);
 
         if (ch_cfg.report_on_change_only) {
-            // track raw value to compare until next report interval
             data->delta[i] = v;
         }
         else {
@@ -185,7 +137,6 @@ static int analog_input_report_data(const struct device *dev) {
         }
     }
 
-    // First read is setup as calibration
     as->calibrate = false;
 
 #if CONFIG_ANALOG_INPUT_REPORT_INTERVAL_MIN > 0
@@ -324,7 +275,6 @@ static void analog_input_async_init(struct k_work *work) {
     const struct device *dev = data->dev;
     const struct analog_input_config *config = dev->config;
 
-    // LOG_DBG("ANALOG_INPUT async init");
     uint32_t ch_mask = 0;
 
     for (uint8_t i = 0; i < config->io_channels_len; i++) {
@@ -333,17 +283,12 @@ static void analog_input_async_init(struct k_work *work) {
         uint8_t channel_id = ch_cfg.adc_channel.channel_id;
 
         struct adc_channel_cfg channel_cfg = {
-            .gain = ADC_GAIN_1_3,
+            .gain = ADC_GAIN_1_4,
             .reference = ADC_REF_VDD_1_4,
-            .acquisition_time = ADC_ACQ_TIME_DEFAULT,
+            .acquisition_time = ADC_ACQ_TIME(ADC_ACQ_TIME_MICROSECONDS, 40),
             .channel_id = channel_id,
-            #ifdef CONFIG_ADC_CONFIGURABLE_INPUTS
-                #ifdef CONFIG_ADC_NRFX_SAADC
-                    .input_positive = SAADC_CH_PSELP_PSELP_AnalogInput0 + channel_id,
-                #else /* CONFIG_ADC_NRFX_SAADC */
-                    .input_positive = channel_id,
-                #endif /* CONFIG_ADC_NRFX_SAADC */
-            #endif /* CONFIG_ADC_CONFIGURABLE_INPUTS */
+            .differential = 0,
+            .input_positive = SAADC_CH_PSELP_PSELP_AnalogInput0 + channel_id
         };
 
         ch_mask |= BIT(channel_id);
